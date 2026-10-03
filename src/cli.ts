@@ -1,16 +1,52 @@
 #!/usr/bin/env node
 import { promises as fs } from 'node:fs';
-import type { ValidationResult } from './validator';
+import type { AnalysisMode, ValidateOptions, ValidationResult } from './validator';
 import { validateJsonText } from './validator';
 
-async function readInput(): Promise<string> {
-  const args = process.argv.slice(2);
+const USAGE =
+  '用法：vmcheck [--mode types|constants] [--constants] [--types] [program.json]；不传文件参数时从标准输入读取';
 
-  if (args.length > 1) {
-    throw new UsageError('用法：vmcheck [program.json]；不传文件参数时从标准输入读取');
+class UsageError extends Error {}
+
+function parseMode(value: string): AnalysisMode {
+  if (value === 'types' || value === 'constants') {
+    return value;
+  }
+  throw new UsageError(`未知分析模式：${value}（可选 types 或 constants）`);
+}
+
+function parseArgs(args: string[]): { filePath?: string; options: ValidateOptions } {
+  let filePath: string | undefined;
+  let mode: AnalysisMode | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === '--constants') {
+      mode = 'constants';
+    } else if (arg === '--types') {
+      mode = 'types';
+    } else if (arg === '--mode') {
+      const value = args[index + 1];
+      if (value === undefined) {
+        throw new UsageError('--mode 需要参数：types 或 constants');
+      }
+      index += 1;
+      mode = parseMode(value);
+    } else if (arg.startsWith('--mode=')) {
+      mode = parseMode(arg.slice('--mode='.length));
+    } else if (arg.startsWith('-')) {
+      throw new UsageError(`未知参数：${arg}\n${USAGE}`);
+    } else if (filePath !== undefined) {
+      throw new UsageError(USAGE);
+    } else {
+      filePath = arg;
+    }
   }
 
-  const [filePath] = args;
+  return { filePath, options: mode === undefined ? {} : { mode } };
+}
+
+async function readInput(filePath: string | undefined): Promise<string> {
   if (filePath !== undefined) {
     return fs.readFile(filePath, 'utf8');
   }
@@ -27,16 +63,16 @@ function readStdin(): Promise<string> {
   });
 }
 
-class UsageError extends Error {}
-
 function printResult(result: ValidationResult): void {
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 async function main(): Promise<number> {
   try {
-    const input = await readInput();
-    const result = validateJsonText(input);
+    const { filePath, options } = parseArgs(process.argv.slice(2));
+    const input = await readInput(filePath);
+    // 命令行显式给出的模式优先于输入信封里的 mode 字段。
+    const result = validateJsonText(input, options);
     printResult(result);
     if (result.kind === 'program') {
       return result.ok ? 0 : 1;

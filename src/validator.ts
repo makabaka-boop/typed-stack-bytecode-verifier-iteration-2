@@ -4,6 +4,22 @@ export const MAX_STACK_DEPTH = 32;
 
 export type StackType = 'int' | 'bool';
 
+export type AnalysisMode = 'types' | 'constants';
+
+export interface ValidateOptions {
+  mode?: AnalysisMode;
+}
+
+/**
+ * 常量感知模式下单个栈槽位的抽象状态：
+ * 要么是可证明的常量，要么是只知道类型的未知值。
+ * 类型部分在两种模式下始终精确。
+ */
+export type ValueState =
+  | { kind: 'const'; type: 'int'; value: number }
+  | { kind: 'const'; type: 'bool'; value: boolean }
+  | { kind: 'unknown'; type: StackType };
+
 export type OpCode =
   | 'PUSH_INT'
   | 'PUSH_BOOL'
@@ -125,14 +141,15 @@ export interface StructuralIssue {
   code:
     | 'input_not_object'
     | 'instructions_not_array'
-    | 'instruction_count_out_of_range';
+    | 'instruction_count_out_of_range'
+    | 'invalid_mode';
   message: string;
   details?: Record<string, unknown>;
 }
 
 interface WorkItem {
   pc: number;
-  stack: StackType[];
+  stack: ValueState[];
   path: WitnessEdge[];
 }
 
@@ -144,6 +161,9 @@ interface AnalyzedProgram {
   pcSignatures: Record<number, StackType[]>;
   maxStackDepth: number;
   issues: ValidationIssue[];
+  /** 以下两个字段只在常量感知模式下出现，默认模式输出保持不变。 */
+  mode?: AnalysisMode;
+  pcStates?: Record<number, ValueState[]>;
 }
 
 export type ValidationResult =
@@ -235,8 +255,65 @@ function decodeProgram(instructions: readonly unknown[]): DecodedInstruction[] {
   );
 }
 
-function sameStack(left: readonly StackType[], right: readonly StackType[]): boolean {
-  return left.length === right.length && left.every((type, index) => type === right[index]);
+function stackTypes(stack: readonly ValueState[]): StackType[] {
+  return stack.map((value) => value.type);
+}
+
+function cloneValueStack(stack: readonly ValueState[]): ValueState[] {
+  return stack.map((value) => ({ ...value }));
+}
+
+function unknownValue(type: StackType): ValueState {
+  return { kind: 'unknown', type };
+}
+
+function sameValueState(left: ValueState, right: ValueState): boolean {
+  if (left.kind === 'unknown' || right.kind === 'unknown') {
+    return left.kind === right.kind && left.type === right.type;
+  }
+  return left.type === right.type && left.value === right.value;
+}
+
+function sameValueStack(
+  left: readonly ValueState[],
+  right: readonly ValueState[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => sameValueState(value, right[index]!))
+  );
+}
+
+/**
+ * 同型槽位合流：相同的可证明常量保持常量，其余情况拓宽为未知。
+ * 类型不同（或深度不同）时无法合流，返回 null。
+ */
+function mergeValueStates(left: ValueState, right: ValueState): ValueState | null {
+  if (left.type !== right.type) {
+    return null;
+  }
+  if (left.kind === 'const' && right.kind === 'const' && left.value === right.value) {
+    return { ...left };
+  }
+  return unknownValue(left.type);
+}
+
+function mergeStacks(
+  existing: readonly ValueState[],
+  incoming: readonly ValueState[]
+): ValueState[] | null {
+  if (existing.length !== incoming.length) {
+    return null;
+  }
+  const merged: ValueState[] = [];
+  for (let index = 0; index < existing.length; index += 1) {
+    const value = mergeValueStates(existing[index]!, incoming[index]!);
+    if (value === null) {
+      return null;
+    }
+    merged.push(value);
+  }
+  return merged;
 }
 
 function cloneStack(stack: readonly StackType[]): StackType[] {
@@ -260,14 +337,14 @@ function edge(
   fromPc: number,
   toPc: number,
   op: string,
-  stackAfter: readonly StackType[]
+  stackAfter: readonly ValueState[]
 ): WitnessEdge {
   return {
     type,
     fromPc,
     toPc,
     op,
-    stackAfter: cloneStack(stackAfter),
+    stackAfter: stackTypes(stackAfter),
   };
 }
 
@@ -318,9 +395,32 @@ function structuralIssue(
   };
 }
 
-export function validateProgram(input: unknown): ValidationResult {
+function isAnalysisMode(value: unknown): value is AnalysisMode {
+  return value === 'types' || value === 'constants';
+}
+
+export function validateProgram(
+  input: unknown,
+  options: ValidateOptions = {}
+): ValidationResult {
   if (typeof input !== 'object' || input === null) {
     return structuralIssue('input_not_object', '输入必须是指令数组或包含 instructions 数组的对象');
+  }
+
+  // 模式属于输入信封的一部分：非法模式必须整次拒绝，不能返回半份报告。
+  let envelopeMode: AnalysisMode | undefined;
+  if (!Array.isArray(input)) {
+    const record = input as Record<string, unknown>;
+    if ('mode' in record) {
+      if (!isAnalysisMode(record.mode)) {
+        return structuralIssue(
+          'invalid_mode',
+          '分析模式 mode 必须是 "types" 或 "constants"',
+          { mode: record.mode }
+        );
+      }
+      envelopeMode = record.mode;
+    }
   }
 
   const rawInstructions = Array.isArray(input)
@@ -347,9 +447,23 @@ export function validateProgram(input: unknown): ValidationResult {
     );
   }
 
+  // 显式传入的选项优先于信封里的 mode 字段；两者都必须合法。
+  let mode: AnalysisMode = envelopeMode ?? 'types';
+  if (options.mode !== undefined) {
+    if (!isAnalysisMode(options.mode)) {
+      return structuralIssue(
+        'invalid_mode',
+        '分析模式 mode 必须是 "types" 或 "constants"',
+        { mode: options.mode }
+      );
+    }
+    mode = options.mode;
+  }
+  const constantsMode = mode === 'constants';
+
   const decoded = decodeProgram(rawInstructions);
   const programLength = decoded.length;
-  const arrivals = new Map<number, StackType[]>();
+  const arrivals = new Map<number, ValueState[]>();
   const arrivalPaths = new Map<number, WitnessEdge[]>();
   const issueByPc = new Map<number, ValidationIssue>();
   const queue: WorkItem[] = [{ pc: 0, stack: [], path: [] }];
@@ -368,48 +482,62 @@ export function validateProgram(input: unknown): ValidationResult {
     }
   };
 
-  const arrive = (item: WorkItem): boolean => {
+  /**
+   * 返回继续传播所用的栈状态；无需继续（重复到达或类型冲突）时返回 null。
+   * 同型不同值合流时把槽位拓宽为未知并返回合流后的状态，调用方必须用
+   * 合流后的状态重新传播后继，不能沿用首次到达时裁掉的后继。
+   */
+  const arrive = (item: WorkItem): ValueState[] | null => {
     const existing = arrivals.get(item.pc);
     if (existing === undefined) {
-      arrivals.set(item.pc, cloneStack(item.stack));
+      arrivals.set(item.pc, cloneValueStack(item.stack));
       arrivalPaths.set(item.pc, cloneWitnessPath(item.path));
-      return true;
+      return item.stack;
     }
 
-    if (sameStack(existing, item.stack)) {
-      return false;
+    const merged = mergeStacks(existing, item.stack);
+    if (merged === null) {
+      const existingPath = arrivalPaths.get(item.pc) ?? [];
+      const conflicts: MergeConflictWitness = {
+        existingStack: stackTypes(existing),
+        incomingStack: stackTypes(item.stack),
+        existingPath: cloneWitnessPath(existingPath),
+        incomingPath: cloneWitnessPath(item.path),
+      };
+      addIssue(
+        makeIssue(
+          item.pc,
+          'stack_merge_conflict',
+          `PC ${item.pc} 的不同可达入边具有不同栈类型序列，控制流不能合流`,
+          stackTypes(item.stack),
+          item.path,
+          {
+            conflicts,
+            details: {
+              existingStack: conflicts.existingStack,
+              incomingStack: conflicts.incomingStack,
+            },
+          }
+        )
+      );
+      return null;
     }
 
-    const existingPath = arrivalPaths.get(item.pc) ?? [];
-    const conflicts: MergeConflictWitness = {
-      existingStack: cloneStack(existing),
-      incomingStack: cloneStack(item.stack),
-      existingPath: cloneWitnessPath(existingPath),
-      incomingPath: cloneWitnessPath(item.path),
-    };
-    addIssue(
-      makeIssue(
-        item.pc,
-        'stack_merge_conflict',
-        `PC ${item.pc} 的不同可达入边具有不同栈类型序列，控制流不能合流`,
-        item.stack,
-        item.path,
-        {
-          conflicts,
-          details: {
-            existingStack: conflicts.existingStack,
-            incomingStack: conflicts.incomingStack,
-          },
-        }
-      )
-    );
-    return false;
+    if (sameValueStack(merged, existing)) {
+      return null;
+    }
+
+    // 合流产生了更一般的状态（某些常量变成未知）：每个槽位最多只会
+    // 从常量提升为未知一次，因此重新传播必然终止。
+    arrivals.set(item.pc, cloneValueStack(merged));
+    arrivalPaths.set(item.pc, cloneWitnessPath(item.path));
+    return merged;
   };
 
   const enqueueSuccessor = (
     fromPc: number,
     toPc: number,
-    stackAfter: StackType[],
+    stackAfter: ValueState[],
     pathAfter: WitnessEdge[],
     edgeType: WitnessEdge['type'],
     op: string
@@ -427,11 +555,12 @@ export function validateProgram(input: unknown): ValidationResult {
       continue;
     }
 
-    if (!arrive(current)) {
+    const stack = arrive(current);
+    if (stack === null) {
       continue;
     }
 
-    const { pc, stack, path } = current;
+    const { pc, path } = current;
     recordDepth(stack.length);
 
     const decodedInstruction = decoded[pc];
@@ -445,7 +574,7 @@ export function validateProgram(input: unknown): ValidationResult {
           pc,
           'malformed_instruction',
           malformedMessage(decodedInstruction.reason),
-          stack,
+          stackTypes(stack),
           path,
           {
             attempted: { type: 'operation', pc, op: String(decodedInstruction.op) },
@@ -469,7 +598,7 @@ export function validateProgram(input: unknown): ValidationResult {
       stackAfter?: StackType[]
     ): void => {
       addIssue(
-        makeIssue(pc, code, message, stack, path, {
+        makeIssue(pc, code, message, stackTypes(stack), path, {
           attempted: { type: 'operation', pc, op, ...(stackAfter ? { stackAfter } : {}) },
           ...(details ? { details } : {}),
         })
@@ -486,7 +615,7 @@ export function validateProgram(input: unknown): ValidationResult {
 
     const continueAt = (
       nextPc: number,
-      stackAfter: StackType[],
+      stackAfter: ValueState[],
       edgeType: WitnessEdge['type'] = 'fall'
     ): void => {
       recordDepth(stackAfter.length);
@@ -496,7 +625,7 @@ export function validateProgram(input: unknown): ValidationResult {
             pc,
             'fall_through',
             `PC ${pc} 执行后跌出程序末尾`,
-            stack,
+            stackTypes(stack),
             path,
             {
               attempted: {
@@ -516,7 +645,7 @@ export function validateProgram(input: unknown): ValidationResult {
 
     const jumpTo = (
       targetPc: number,
-      stackAfter: StackType[],
+      stackAfter: ValueState[],
       edgeType: 'jump' | 'true_branch' | 'false_branch'
     ): void => {
       recordDepth(stackAfter.length);
@@ -526,7 +655,7 @@ export function validateProgram(input: unknown): ValidationResult {
             pc,
             'jump_target_out_of_bounds',
             `PC ${pc} 的 ${op} 目标地址 ${targetPc} 越界`,
-            stack,
+            stackTypes(stack),
             path,
             {
               attempted: {
@@ -547,6 +676,9 @@ export function validateProgram(input: unknown): ValidationResult {
 
     switch (instruction.op) {
       case 'PUSH_INT': {
+        const pushed: ValueState = constantsMode
+          ? { kind: 'const', type: 'int', value: instruction.value }
+          : unknownValue('int');
         if (stack.length >= MAX_STACK_DEPTH) {
           operationIssue(
             'stack_overflow',
@@ -555,15 +687,18 @@ export function validateProgram(input: unknown): ValidationResult {
               maxStackDepth: MAX_STACK_DEPTH,
               attemptedSize: stack.length + 1,
             },
-            [...stack, 'int']
+            stackTypes([...stack, pushed])
           );
           break;
         }
-        continueAt(pc + 1, [...stack, 'int']);
+        continueAt(pc + 1, [...stack, pushed]);
         break;
       }
 
       case 'PUSH_BOOL': {
+        const pushed: ValueState = constantsMode
+          ? { kind: 'const', type: 'bool', value: instruction.value }
+          : unknownValue('bool');
         if (stack.length >= MAX_STACK_DEPTH) {
           operationIssue(
             'stack_overflow',
@@ -572,11 +707,11 @@ export function validateProgram(input: unknown): ValidationResult {
               maxStackDepth: MAX_STACK_DEPTH,
               attemptedSize: stack.length + 1,
             },
-            [...stack, 'bool']
+            stackTypes([...stack, pushed])
           );
           break;
         }
-        continueAt(pc + 1, [...stack, 'bool']);
+        continueAt(pc + 1, [...stack, pushed]);
         break;
       }
 
@@ -587,21 +722,24 @@ export function validateProgram(input: unknown): ValidationResult {
         }
         const right = stack[stack.length - 1]!;
         const left = stack[stack.length - 2]!;
-        if (left !== 'int' || right !== 'int') {
+        if (left.type !== 'int' || right.type !== 'int') {
           operationIssue(
             'type_error',
             `PC ${pc} 的 ADD 只接受两个整数`,
             {
               expected: ['int', 'int'],
-              actual: [left, right],
-              leftType: left,
-              rightType: right,
+              actual: [left.type, right.type],
+              leftType: left.type,
+              rightType: right.type,
             }
           );
           break;
         }
-        const nextStack: StackType[] = [...stack.slice(0, -2), 'int'];
-        continueAt(pc + 1, nextStack);
+        const result: ValueState =
+          left.kind === 'const' && right.kind === 'const'
+            ? { kind: 'const', type: 'int', value: left.value + right.value }
+            : unknownValue('int');
+        continueAt(pc + 1, [...stack.slice(0, -2), result]);
         break;
       }
 
@@ -612,18 +750,22 @@ export function validateProgram(input: unknown): ValidationResult {
         }
         const right = stack[stack.length - 1]!;
         const left = stack[stack.length - 2]!;
-        if (left !== right) {
+        if (left.type !== right.type) {
           operationIssue(
             'type_error',
             `PC ${pc} 的 EQ 只能比较两个同类型值`,
             {
-              leftType: left,
-              rightType: right,
+              leftType: left.type,
+              rightType: right.type,
             }
           );
           break;
         }
-        continueAt(pc + 1, [...stack.slice(0, -2), 'bool']);
+        const result: ValueState =
+          left.kind === 'const' && right.kind === 'const'
+            ? { kind: 'const', type: 'bool', value: left.value === right.value }
+            : unknownValue('bool');
+        continueAt(pc + 1, [...stack.slice(0, -2), result]);
         break;
       }
 
@@ -633,15 +775,19 @@ export function validateProgram(input: unknown): ValidationResult {
           break;
         }
         const top = stack[stack.length - 1]!;
-        if (top !== 'bool') {
+        if (top.type !== 'bool') {
           operationIssue(
             'type_error',
             `PC ${pc} 的 NOT 只接受布尔值`,
-            { expected: 'bool', actual: top, topType: top }
+            { expected: 'bool', actual: top.type, topType: top.type }
           );
           break;
         }
-        continueAt(pc + 1, [...stack.slice(0, -1), 'bool']);
+        const result: ValueState =
+          top.kind === 'const' && top.type === 'bool'
+            ? { kind: 'const', type: 'bool', value: !top.value }
+            : unknownValue('bool');
+        continueAt(pc + 1, [...stack.slice(0, -1), result]);
         break;
       }
 
@@ -650,8 +796,8 @@ export function validateProgram(input: unknown): ValidationResult {
           underflow(1);
           break;
         }
+        const top = stack[stack.length - 1]!;
         if (stack.length >= MAX_STACK_DEPTH) {
-          const top = stack[stack.length - 1]!;
           operationIssue(
             'stack_overflow',
             `PC ${pc} 复制栈顶将超过最大栈深 ${MAX_STACK_DEPTH}`,
@@ -659,12 +805,11 @@ export function validateProgram(input: unknown): ValidationResult {
               maxStackDepth: MAX_STACK_DEPTH,
               attemptedSize: stack.length + 1,
             },
-            [...stack, top]
+            stackTypes([...stack, top])
           );
           break;
         }
-        const top = stack[stack.length - 1]!;
-        continueAt(pc + 1, [...stack, top]);
+        continueAt(pc + 1, [...stack, { ...top }]);
         break;
       }
 
@@ -678,7 +823,7 @@ export function validateProgram(input: unknown): ValidationResult {
       }
 
       case 'JUMP': {
-        jumpTo(instruction.target, cloneStack(stack), 'jump');
+        jumpTo(instruction.target, cloneValueStack(stack), 'jump');
         break;
       }
 
@@ -688,17 +833,27 @@ export function validateProgram(input: unknown): ValidationResult {
           break;
         }
         const top = stack[stack.length - 1]!;
-        if (top !== 'bool') {
+        if (top.type !== 'bool') {
           operationIssue(
             'type_error',
             `PC ${pc} 的 JUMP_IF_FALSE 只接受弹出的布尔值`,
-            { expected: 'bool', actual: top, topType: top }
+            { expected: 'bool', actual: top.type, topType: top.type }
           );
           break;
         }
         const afterPop = stack.slice(0, -1);
-        jumpTo(instruction.target, afterPop, 'false_branch');
-        continueAt(pc + 1, cloneStack(afterPop), 'true_branch');
+        if (top.kind === 'const' && top.type === 'bool') {
+          // 可证明的常量条件：只沿实际会走的边传播，另一条边证明不可达。
+          if (top.value) {
+            continueAt(pc + 1, afterPop, 'true_branch');
+          } else {
+            jumpTo(instruction.target, afterPop, 'false_branch');
+          }
+        } else {
+          // 未知条件必须保守探索两边。
+          jumpTo(instruction.target, afterPop, 'false_branch');
+          continueAt(pc + 1, [...afterPop], 'true_branch');
+        }
         break;
       }
 
@@ -711,12 +866,12 @@ export function validateProgram(input: unknown): ValidationResult {
           );
           break;
         }
-        const top = stack[0];
-        if (top !== 'bool') {
+        const top = stack[0]!;
+        if (top.type !== 'bool') {
           operationIssue(
             'halt_stack_not_boolean',
             'HALT 时唯一的栈值必须是布尔值',
-            { expected: 'bool', actual: top, topType: top }
+            { expected: 'bool', actual: top.type, topType: top.type }
           );
         }
         break;
@@ -726,7 +881,7 @@ export function validateProgram(input: unknown): ValidationResult {
 
   const reachablePcs = [...arrivals.keys()].sort((a, b) => a - b);
   const pcSignatures = Object.fromEntries(
-    reachablePcs.map((pc) => [pc, cloneStack(arrivals.get(pc) ?? [])])
+    reachablePcs.map((pc) => [pc, stackTypes(arrivals.get(pc) ?? [])])
   );
   const deadPcs = decoded
     .map((_, pc) => pc)
@@ -739,19 +894,30 @@ export function validateProgram(input: unknown): ValidationResult {
     return left.code.localeCompare(right.code);
   });
 
+  const analysis: AnalyzedProgram = {
+    valid: issues.length === 0,
+    status: issues.length === 0 ? 'valid' : 'invalid',
+    reachablePcs,
+    deadPcs,
+    pcSignatures,
+    maxStackDepth,
+    issues,
+  };
+
+  if (constantsMode) {
+    // 可达清单、最大栈深、错误报告都来自上面同一次不动点传播；
+    // pcStates 只是同一份到达状态的常量视角，保证四处不描述不同的控制流。
+    analysis.mode = 'constants';
+    analysis.pcStates = Object.fromEntries(
+      reachablePcs.map((pc) => [pc, cloneValueStack(arrivals.get(pc) ?? [])])
+    );
+  }
+
   return {
     ok: issues.length === 0,
     kind: 'program',
     instructionCount: programLength,
-    analysis: {
-      valid: issues.length === 0,
-      status: issues.length === 0 ? 'valid' : 'invalid',
-      reachablePcs,
-      deadPcs,
-      pcSignatures,
-      maxStackDepth,
-      issues,
-    },
+    analysis,
   };
 }
 
@@ -759,10 +925,13 @@ function cloneWitnessPath(path: readonly WitnessEdge[]): WitnessEdge[] {
   return path.map((item) => ({ ...item, stackAfter: [...item.stackAfter] }));
 }
 
-export function validateJsonText(text: string): ValidationResult {
+export function validateJsonText(
+  text: string,
+  options: ValidateOptions = {}
+): ValidationResult {
   try {
     const parsed: unknown = JSON.parse(text);
-    return validateProgram(parsed);
+    return validateProgram(parsed, options);
   } catch (error) {
     return {
       ok: false,
