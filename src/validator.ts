@@ -62,11 +62,20 @@ export type DecodedInstruction =
         | 'missing_integer_target';
     };
 
-export interface AttemptedOperation {
+/**
+ * 常量感知模式下的栈槽：在类型之外记录可证明的常量值。
+ * value 为 null 表示该槽的值在分析中不可证明（未知）。
+ */
+export interface ConstantSlot {
+  type: StackType;
+  value: number | boolean | null;
+}
+
+export interface AttemptedOperation<S = StackType> {
   type: 'operation';
   pc: number;
   op: string;
-  stackAfter?: StackType[];
+  stackAfter?: S[];
 }
 
 export interface AttemptedJump {
@@ -84,40 +93,40 @@ export interface AttemptedFallThrough {
   programLength: number;
 }
 
-export type AttemptedEdge =
-  | AttemptedOperation
+export type AttemptedEdge<S = StackType> =
+  | AttemptedOperation<S>
   | AttemptedJump
   | AttemptedFallThrough;
 
-export interface WitnessEdge {
+export interface WitnessEdge<S = StackType> {
   type: 'fall' | 'jump' | 'true_branch' | 'false_branch';
   fromPc: number;
   toPc: number;
   op: string;
-  stackAfter: StackType[];
+  stackAfter: S[];
 }
 
-export interface MergeConflictWitness {
-  existingStack: StackType[];
-  incomingStack: StackType[];
-  existingPath: WitnessEdge[];
-  incomingPath: WitnessEdge[];
+export interface MergeConflictWitness<S = StackType> {
+  existingStack: S[];
+  incomingStack: S[];
+  existingPath: WitnessEdge<S>[];
+  incomingPath: WitnessEdge<S>[];
 }
 
-export interface Witness {
+export interface Witness<S = StackType> {
   startPc: 0;
-  entryStack: StackType[];
-  path: WitnessEdge[];
-  attempted?: AttemptedEdge;
-  conflicts?: MergeConflictWitness;
+  entryStack: S[];
+  path: WitnessEdge<S>[];
+  attempted?: AttemptedEdge<S>;
+  conflicts?: MergeConflictWitness<S>;
 }
 
-export interface ValidationIssue {
+export interface ValidationIssue<S = StackType> {
   pc: number;
   code: string;
   message: string;
-  entryStack: StackType[];
-  witness: Witness;
+  entryStack: S[];
+  witness: Witness<S>;
   details?: Record<string, unknown>;
 }
 
@@ -130,39 +139,72 @@ export interface StructuralIssue {
   details?: Record<string, unknown>;
 }
 
-interface WorkItem {
-  pc: number;
-  stack: StackType[];
-  path: WitnessEdge[];
+export interface OptionsIssue {
+  code: 'invalid_options';
+  message: string;
+  details?: Record<string, unknown>;
 }
 
-interface AnalyzedProgram {
+export interface ValidateOptions {
+  /**
+   * 启用常量感知分析：栈状态在类型之外跟踪可证明的常量，
+   * 可证明不会走到的分支不再探索。缺省（false）为纯类型分析，
+   * 输出与历史版本逐字段一致。
+   */
+  constantAware?: boolean;
+}
+
+export interface ProgramAnalysis<S = StackType> {
   valid: boolean;
   status: 'valid' | 'invalid';
   reachablePcs: number[];
   deadPcs: number[];
-  pcSignatures: Record<number, StackType[]>;
+  pcSignatures: Record<number, S[]>;
   maxStackDepth: number;
-  issues: ValidationIssue[];
+  issues: ValidationIssue<S>[];
 }
 
-export type ValidationResult =
-  | {
-      ok: false;
-      kind: 'json_parse_error';
-      issue: { code: 'invalid_json'; message: string };
-    }
-  | {
-      ok: false;
-      kind: 'structural_error';
-      issue: StructuralIssue;
-    }
-  | {
-      ok: boolean;
-      kind: 'program';
-      instructionCount: number;
-      analysis: AnalyzedProgram;
-    };
+export interface JsonParseErrorResult {
+  ok: false;
+  kind: 'json_parse_error';
+  issue: { code: 'invalid_json'; message: string };
+}
+
+export interface StructuralErrorResult {
+  ok: false;
+  kind: 'structural_error';
+  issue: StructuralIssue;
+}
+
+export interface InvalidOptionsResult {
+  ok: false;
+  kind: 'invalid_options';
+  issue: OptionsIssue;
+}
+
+export type ValidationFailure =
+  | JsonParseErrorResult
+  | StructuralErrorResult
+  | InvalidOptionsResult;
+
+export interface ProgramResult {
+  ok: boolean;
+  kind: 'program';
+  instructionCount: number;
+  analysis: ProgramAnalysis<StackType>;
+}
+
+export interface ConstantProgramResult {
+  ok: boolean;
+  kind: 'program';
+  mode: 'constant_aware';
+  instructionCount: number;
+  analysis: ProgramAnalysis<ConstantSlot>;
+}
+
+export type ValidationResult = ValidationFailure | ProgramResult;
+
+export type ConstantValidationResult = ValidationFailure | ConstantProgramResult;
 
 const NO_OPERAND_OPS: ReadonlySet<string> = new Set([
   'ADD',
@@ -239,10 +281,6 @@ function sameStack(left: readonly StackType[], right: readonly StackType[]): boo
   return left.length === right.length && left.every((type, index) => type === right[index]);
 }
 
-function cloneStack(stack: readonly StackType[]): StackType[] {
-  return [...stack];
-}
-
 function malformedMessage(reason: string): string {
   const messages: Record<string, string> = {
     instruction_not_object: '指令必须是包含 op 字段的对象',
@@ -255,38 +293,146 @@ function malformedMessage(reason: string): string {
   return messages[reason] ?? '指令格式错误';
 }
 
-function edge(
-  type: WitnessEdge['type'],
+/**
+ * 抽象域语义。默认模式只跟踪栈类型（S = StackType）；常量感知模式
+ * 额外跟踪可证明的常量（S = ConstantSlot）。两种模式共享同一套
+ * 工作队列引擎，错误检查只依赖类型与栈深，因此在两个域中一致。
+ */
+interface Semantics<S> {
+  cloneStack(stack: readonly S[]): S[];
+  slotType(slot: S): StackType;
+  pushInt(value: number): S;
+  pushBool(value: boolean): S;
+  add(left: S, right: S): S;
+  equal(left: S, right: S): S;
+  not(value: S): S;
+  /**
+   * 同一 PC 的入边合流。栈类型序列不兼容时返回 null（合流冲突）；
+   * 否则返回合流后的栈，changed 表示相对 existing 是否变宽。
+   * 变宽时必须用合流状态重新传播，不能沿用首次到达时裁掉的后继。
+   */
+  joinStacks(
+    existing: readonly S[],
+    incoming: readonly S[]
+  ): { stack: S[]; changed: boolean } | null;
+  /** JUMP_IF_FALSE 弹出 top 后需要探索的分支；可证明的常量条件会裁掉不会走的一侧。 */
+  branches(top: S): { trueBranch: boolean; falseBranch: boolean };
+}
+
+const typeSemantics: Semantics<StackType> = {
+  cloneStack: (stack) => [...stack],
+  slotType: (slot) => slot,
+  pushInt: () => 'int',
+  pushBool: () => 'bool',
+  add: () => 'int',
+  equal: () => 'bool',
+  not: () => 'bool',
+  joinStacks: (existing, incoming) =>
+    sameStack(existing, incoming)
+      ? { stack: [...existing], changed: false }
+      : null,
+  branches: () => ({ trueBranch: true, falseBranch: true }),
+};
+
+const unknownSlot = (type: StackType): ConstantSlot => ({ type, value: null });
+
+const constantSemantics: Semantics<ConstantSlot> = {
+  cloneStack: (stack) => stack.map((slot) => ({ ...slot })),
+  slotType: (slot) => slot.type,
+  pushInt: (value) => ({ type: 'int', value }),
+  pushBool: (value) => ({ type: 'bool', value }),
+  add: (left, right) =>
+    typeof left.value === 'number' && typeof right.value === 'number'
+      ? { type: 'int', value: left.value + right.value }
+      : unknownSlot('int'),
+  equal: (left, right) =>
+    left.value !== null && right.value !== null
+      ? { type: 'bool', value: left.value === right.value }
+      : unknownSlot('bool'),
+  not: (value) =>
+    typeof value.value === 'boolean'
+      ? { type: 'bool', value: !value.value }
+      : unknownSlot('bool'),
+  joinStacks: (existing, incoming) => {
+    if (existing.length !== incoming.length) {
+      return null;
+    }
+    let changed = false;
+    const merged: ConstantSlot[] = [];
+    for (let index = 0; index < existing.length; index += 1) {
+      const left = existing[index]!;
+      const right = incoming[index]!;
+      if (left.type !== right.type) {
+        return null;
+      }
+      if (left.value === null || right.value === null) {
+        merged.push(unknownSlot(left.type));
+        if (left.value !== null) {
+          changed = true;
+        }
+      } else if (left.value === right.value) {
+        merged.push({ type: left.type, value: left.value });
+      } else {
+        // 同型不同常量：合流后该槽不可证明，变宽为未知
+        merged.push(unknownSlot(left.type));
+        changed = true;
+      }
+    }
+    return { stack: merged, changed };
+  },
+  branches: (top) => {
+    if (top.value === true) {
+      return { trueBranch: true, falseBranch: false };
+    }
+    if (top.value === false) {
+      return { trueBranch: false, falseBranch: true };
+    }
+    return { trueBranch: true, falseBranch: true };
+  },
+};
+
+interface WorkItem<S> {
+  pc: number;
+  stack: S[];
+  path: WitnessEdge<S>[];
+}
+
+function edge<S>(
+  type: WitnessEdge<S>['type'],
   fromPc: number,
   toPc: number,
   op: string,
-  stackAfter: readonly StackType[]
-): WitnessEdge {
+  stackAfter: readonly S[]
+): WitnessEdge<S> {
   return {
     type,
     fromPc,
     toPc,
     op,
-    stackAfter: cloneStack(stackAfter),
+    stackAfter: [...stackAfter],
   };
 }
 
-function makeIssue(
+function cloneWitnessPath<S>(path: readonly WitnessEdge<S>[]): WitnessEdge<S>[] {
+  return path.map((item) => ({ ...item, stackAfter: [...item.stackAfter] }));
+}
+
+function makeIssue<S>(
   pc: number,
   code: string,
   message: string,
-  entryStack: readonly StackType[],
-  path: readonly WitnessEdge[],
+  entryStack: readonly S[],
+  path: readonly WitnessEdge<S>[],
   options: {
-    attempted?: AttemptedEdge;
-    conflicts?: MergeConflictWitness;
+    attempted?: AttemptedEdge<S>;
+    conflicts?: MergeConflictWitness<S>;
     details?: Record<string, unknown>;
   } = {}
-): ValidationIssue {
-  const witness: Witness = {
+): ValidationIssue<S> {
+  const witness: Witness<S> = {
     startPc: 0,
-    entryStack: cloneStack(entryStack),
-    path: path.map((item) => ({ ...item, stackAfter: [...item.stackAfter] })),
+    entryStack: [...entryStack],
+    path: cloneWitnessPath(path),
   };
 
   if (options.attempted) {
@@ -300,7 +446,7 @@ function makeIssue(
     pc,
     code,
     message,
-    entryStack: cloneStack(entryStack),
+    entryStack: [...entryStack],
     witness,
     ...(options.details ? { details: options.details } : {}),
   };
@@ -318,48 +464,22 @@ function structuralIssue(
   };
 }
 
-export function validateProgram(input: unknown): ValidationResult {
-  if (typeof input !== 'object' || input === null) {
-    return structuralIssue('input_not_object', '输入必须是指令数组或包含 instructions 数组的对象');
-  }
-
-  const rawInstructions = Array.isArray(input)
-    ? input
-    : (input as Record<string, unknown>).instructions;
-  if (!Array.isArray(rawInstructions)) {
-    return structuralIssue(
-      'instructions_not_array',
-      '输入必须是指令数组，或包含数组字段 instructions 的对象'
-    );
-  }
-  if (
-    rawInstructions.length < MIN_PROGRAM_LENGTH ||
-    rawInstructions.length > MAX_PROGRAM_LENGTH
-  ) {
-    return structuralIssue(
-      'instruction_count_out_of_range',
-      `指令数量必须在 ${MIN_PROGRAM_LENGTH} 到 ${MAX_PROGRAM_LENGTH} 条之间`,
-      {
-        min: MIN_PROGRAM_LENGTH,
-        max: MAX_PROGRAM_LENGTH,
-        actual: rawInstructions.length,
-      }
-    );
-  }
-
-  const decoded = decodeProgram(rawInstructions);
+function analyzeProgram<S>(
+  decoded: DecodedInstruction[],
+  semantics: Semantics<S>
+): ProgramAnalysis<S> {
   const programLength = decoded.length;
-  const arrivals = new Map<number, StackType[]>();
-  const arrivalPaths = new Map<number, WitnessEdge[]>();
-  const issueByPc = new Map<number, ValidationIssue>();
-  const queue: WorkItem[] = [{ pc: 0, stack: [], path: [] }];
+  const arrivals = new Map<number, S[]>();
+  const arrivalPaths = new Map<number, WitnessEdge<S>[]>();
+  const issueByPc = new Map<number, ValidationIssue<S>>();
+  const queue: WorkItem<S>[] = [{ pc: 0, stack: [], path: [] }];
   let maxStackDepth = 0;
 
   const recordDepth = (depth: number): void => {
     maxStackDepth = Math.max(maxStackDepth, depth);
   };
 
-  const addIssue = (issue: ValidationIssue): void => {
+  const addIssue = (issue: ValidationIssue<S>): void => {
     // A later back/branch edge can reach a PC after BFS already evaluated one
     // predecessor. The merge mismatch is the controlling error at that PC and
     // must not be hidden by an issue observed through only one predecessor.
@@ -368,50 +488,65 @@ export function validateProgram(input: unknown): ValidationResult {
     }
   };
 
-  const arrive = (item: WorkItem): boolean => {
+  // 返回 null 表示不再处理；否则返回应当（重新）传播的状态。
+  // 同型不同值合流后状态变宽时，用合流状态从该 PC 重新传播，
+  // 首次到达时裁掉的后继不能沿用。
+  const arrive = (item: WorkItem<S>): WorkItem<S> | null => {
     const existing = arrivals.get(item.pc);
     if (existing === undefined) {
-      arrivals.set(item.pc, cloneStack(item.stack));
+      arrivals.set(item.pc, semantics.cloneStack(item.stack));
       arrivalPaths.set(item.pc, cloneWitnessPath(item.path));
-      return true;
+      return item;
     }
 
-    if (sameStack(existing, item.stack)) {
-      return false;
+    const joined = semantics.joinStacks(existing, item.stack);
+    if (joined === null) {
+      const existingPath = arrivalPaths.get(item.pc) ?? [];
+      const conflicts: MergeConflictWitness<S> = {
+        existingStack: semantics.cloneStack(existing),
+        incomingStack: semantics.cloneStack(item.stack),
+        existingPath: cloneWitnessPath(existingPath),
+        incomingPath: cloneWitnessPath(item.path),
+      };
+      addIssue(
+        makeIssue(
+          item.pc,
+          'stack_merge_conflict',
+          `PC ${item.pc} 的不同可达入边具有不同栈类型序列，控制流不能合流`,
+          item.stack,
+          item.path,
+          {
+            conflicts,
+            details: {
+              existingStack: conflicts.existingStack,
+              incomingStack: conflicts.incomingStack,
+            },
+          }
+        )
+      );
+      return null;
     }
 
-    const existingPath = arrivalPaths.get(item.pc) ?? [];
-    const conflicts: MergeConflictWitness = {
-      existingStack: cloneStack(existing),
-      incomingStack: cloneStack(item.stack),
-      existingPath: cloneWitnessPath(existingPath),
-      incomingPath: cloneWitnessPath(item.path),
+    if (!joined.changed) {
+      return null;
+    }
+
+    arrivals.set(item.pc, semantics.cloneStack(joined.stack));
+    // 见证路径保留首次到达的路径：它是到达该 PC 的一条真实控制流路径。
+    const recordedPath = arrivalPaths.get(item.pc) ?? [];
+    return {
+      pc: item.pc,
+      stack: joined.stack,
+      path: cloneWitnessPath(recordedPath),
     };
-    addIssue(
-      makeIssue(
-        item.pc,
-        'stack_merge_conflict',
-        `PC ${item.pc} 的不同可达入边具有不同栈类型序列，控制流不能合流`,
-        item.stack,
-        item.path,
-        {
-          conflicts,
-          details: {
-            existingStack: conflicts.existingStack,
-            incomingStack: conflicts.incomingStack,
-          },
-        }
-      )
-    );
-    return false;
   };
 
   const enqueueSuccessor = (
     fromPc: number,
     toPc: number,
-    stackAfter: StackType[],
-    pathAfter: WitnessEdge[],
-    edgeType: WitnessEdge['type'],
+    stackAfter: S[],
+    pathAfter: WitnessEdge<S>[],
+    edgeType: WitnessEdge<S>['type'],
     op: string
   ): void => {
     const nextPath = [
@@ -427,11 +562,12 @@ export function validateProgram(input: unknown): ValidationResult {
       continue;
     }
 
-    if (!arrive(current)) {
+    const arrived = arrive(current);
+    if (arrived === null) {
       continue;
     }
 
-    const { pc, stack, path } = current;
+    const { pc, stack, path } = arrived;
     recordDepth(stack.length);
 
     const decodedInstruction = decoded[pc];
@@ -466,7 +602,7 @@ export function validateProgram(input: unknown): ValidationResult {
       code: string,
       message: string,
       details?: Record<string, unknown>,
-      stackAfter?: StackType[]
+      stackAfter?: S[]
     ): void => {
       addIssue(
         makeIssue(pc, code, message, stack, path, {
@@ -486,8 +622,8 @@ export function validateProgram(input: unknown): ValidationResult {
 
     const continueAt = (
       nextPc: number,
-      stackAfter: StackType[],
-      edgeType: WitnessEdge['type'] = 'fall'
+      stackAfter: S[],
+      edgeType: WitnessEdge<S>['type'] = 'fall'
     ): void => {
       recordDepth(stackAfter.length);
       if (nextPc >= programLength) {
@@ -516,7 +652,7 @@ export function validateProgram(input: unknown): ValidationResult {
 
     const jumpTo = (
       targetPc: number,
-      stackAfter: StackType[],
+      stackAfter: S[],
       edgeType: 'jump' | 'true_branch' | 'false_branch'
     ): void => {
       recordDepth(stackAfter.length);
@@ -555,11 +691,11 @@ export function validateProgram(input: unknown): ValidationResult {
               maxStackDepth: MAX_STACK_DEPTH,
               attemptedSize: stack.length + 1,
             },
-            [...stack, 'int']
+            [...stack, semantics.pushInt(instruction.value)]
           );
           break;
         }
-        continueAt(pc + 1, [...stack, 'int']);
+        continueAt(pc + 1, [...stack, semantics.pushInt(instruction.value)]);
         break;
       }
 
@@ -572,11 +708,11 @@ export function validateProgram(input: unknown): ValidationResult {
               maxStackDepth: MAX_STACK_DEPTH,
               attemptedSize: stack.length + 1,
             },
-            [...stack, 'bool']
+            [...stack, semantics.pushBool(instruction.value)]
           );
           break;
         }
-        continueAt(pc + 1, [...stack, 'bool']);
+        continueAt(pc + 1, [...stack, semantics.pushBool(instruction.value)]);
         break;
       }
 
@@ -587,20 +723,22 @@ export function validateProgram(input: unknown): ValidationResult {
         }
         const right = stack[stack.length - 1]!;
         const left = stack[stack.length - 2]!;
-        if (left !== 'int' || right !== 'int') {
+        const leftType = semantics.slotType(left);
+        const rightType = semantics.slotType(right);
+        if (leftType !== 'int' || rightType !== 'int') {
           operationIssue(
             'type_error',
             `PC ${pc} 的 ADD 只接受两个整数`,
             {
               expected: ['int', 'int'],
-              actual: [left, right],
-              leftType: left,
-              rightType: right,
+              actual: [leftType, rightType],
+              leftType,
+              rightType,
             }
           );
           break;
         }
-        const nextStack: StackType[] = [...stack.slice(0, -2), 'int'];
+        const nextStack = [...stack.slice(0, -2), semantics.add(left, right)];
         continueAt(pc + 1, nextStack);
         break;
       }
@@ -612,18 +750,20 @@ export function validateProgram(input: unknown): ValidationResult {
         }
         const right = stack[stack.length - 1]!;
         const left = stack[stack.length - 2]!;
-        if (left !== right) {
+        const leftType = semantics.slotType(left);
+        const rightType = semantics.slotType(right);
+        if (leftType !== rightType) {
           operationIssue(
             'type_error',
             `PC ${pc} 的 EQ 只能比较两个同类型值`,
             {
-              leftType: left,
-              rightType: right,
+              leftType,
+              rightType,
             }
           );
           break;
         }
-        continueAt(pc + 1, [...stack.slice(0, -2), 'bool']);
+        continueAt(pc + 1, [...stack.slice(0, -2), semantics.equal(left, right)]);
         break;
       }
 
@@ -633,15 +773,16 @@ export function validateProgram(input: unknown): ValidationResult {
           break;
         }
         const top = stack[stack.length - 1]!;
-        if (top !== 'bool') {
+        const topType = semantics.slotType(top);
+        if (topType !== 'bool') {
           operationIssue(
             'type_error',
             `PC ${pc} 的 NOT 只接受布尔值`,
-            { expected: 'bool', actual: top, topType: top }
+            { expected: 'bool', actual: topType, topType }
           );
           break;
         }
-        continueAt(pc + 1, [...stack.slice(0, -1), 'bool']);
+        continueAt(pc + 1, [...stack.slice(0, -1), semantics.not(top)]);
         break;
       }
 
@@ -650,8 +791,8 @@ export function validateProgram(input: unknown): ValidationResult {
           underflow(1);
           break;
         }
+        const top = stack[stack.length - 1]!;
         if (stack.length >= MAX_STACK_DEPTH) {
-          const top = stack[stack.length - 1]!;
           operationIssue(
             'stack_overflow',
             `PC ${pc} 复制栈顶将超过最大栈深 ${MAX_STACK_DEPTH}`,
@@ -663,7 +804,6 @@ export function validateProgram(input: unknown): ValidationResult {
           );
           break;
         }
-        const top = stack[stack.length - 1]!;
         continueAt(pc + 1, [...stack, top]);
         break;
       }
@@ -678,7 +818,7 @@ export function validateProgram(input: unknown): ValidationResult {
       }
 
       case 'JUMP': {
-        jumpTo(instruction.target, cloneStack(stack), 'jump');
+        jumpTo(instruction.target, semantics.cloneStack(stack), 'jump');
         break;
       }
 
@@ -688,17 +828,23 @@ export function validateProgram(input: unknown): ValidationResult {
           break;
         }
         const top = stack[stack.length - 1]!;
-        if (top !== 'bool') {
+        const topType = semantics.slotType(top);
+        if (topType !== 'bool') {
           operationIssue(
             'type_error',
             `PC ${pc} 的 JUMP_IF_FALSE 只接受弹出的布尔值`,
-            { expected: 'bool', actual: top, topType: top }
+            { expected: 'bool', actual: topType, topType }
           );
           break;
         }
         const afterPop = stack.slice(0, -1);
-        jumpTo(instruction.target, afterPop, 'false_branch');
-        continueAt(pc + 1, cloneStack(afterPop), 'true_branch');
+        const { trueBranch, falseBranch } = semantics.branches(top);
+        if (falseBranch) {
+          jumpTo(instruction.target, semantics.cloneStack(afterPop), 'false_branch');
+        }
+        if (trueBranch) {
+          continueAt(pc + 1, semantics.cloneStack(afterPop), 'true_branch');
+        }
         break;
       }
 
@@ -711,12 +857,12 @@ export function validateProgram(input: unknown): ValidationResult {
           );
           break;
         }
-        const top = stack[0];
-        if (top !== 'bool') {
+        const topType = semantics.slotType(stack[0]!);
+        if (topType !== 'bool') {
           operationIssue(
             'halt_stack_not_boolean',
             'HALT 时唯一的栈值必须是布尔值',
-            { expected: 'bool', actual: top, topType: top }
+            { expected: 'bool', actual: topType, topType }
           );
         }
         break;
@@ -726,7 +872,7 @@ export function validateProgram(input: unknown): ValidationResult {
 
   const reachablePcs = [...arrivals.keys()].sort((a, b) => a - b);
   const pcSignatures = Object.fromEntries(
-    reachablePcs.map((pc) => [pc, cloneStack(arrivals.get(pc) ?? [])])
+    reachablePcs.map((pc) => [pc, semantics.cloneStack(arrivals.get(pc) ?? [])])
   );
   const deadPcs = decoded
     .map((_, pc) => pc)
@@ -740,29 +886,146 @@ export function validateProgram(input: unknown): ValidationResult {
   });
 
   return {
-    ok: issues.length === 0,
-    kind: 'program',
-    instructionCount: programLength,
-    analysis: {
-      valid: issues.length === 0,
-      status: issues.length === 0 ? 'valid' : 'invalid',
-      reachablePcs,
-      deadPcs,
-      pcSignatures,
-      maxStackDepth,
-      issues,
-    },
+    valid: issues.length === 0,
+    status: issues.length === 0 ? 'valid' : 'invalid',
+    reachablePcs,
+    deadPcs,
+    pcSignatures,
+    maxStackDepth,
+    issues,
   };
 }
 
-function cloneWitnessPath(path: readonly WitnessEdge[]): WitnessEdge[] {
-  return path.map((item) => ({ ...item, stackAfter: [...item.stackAfter] }));
+const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set(['constantAware']);
+
+type NormalizedOptions =
+  | { ok: true; constantAware: boolean }
+  | { ok: false; issue: OptionsIssue };
+
+// 模式选项本身非法时整次拒绝，不返回任何部分分析结果。
+function normalizeOptions(options: unknown): NormalizedOptions {
+  const reject = (
+    message: string,
+    details?: Record<string, unknown>
+  ): NormalizedOptions => ({
+    ok: false,
+    issue: {
+      code: 'invalid_options',
+      message,
+      ...(details ? { details } : {}),
+    },
+  });
+
+  if (options === undefined) {
+    return { ok: true, constantAware: false };
+  }
+  if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    return reject('分析选项必须是对象，例如 { "constantAware": true }');
+  }
+  const record = options as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!KNOWN_OPTION_KEYS.has(key)) {
+      return reject(`未知的分析选项 ${key}`, { option: key });
+    }
+  }
+  const constantAware = record.constantAware;
+  if (constantAware !== undefined && typeof constantAware !== 'boolean') {
+    return reject('constantAware 选项必须是布尔值', {
+      option: 'constantAware',
+    });
+  }
+  return { ok: true, constantAware: constantAware === true };
 }
 
-export function validateJsonText(text: string): ValidationResult {
+export function validateProgram(
+  input: unknown,
+  options: { constantAware: true }
+): ConstantValidationResult;
+export function validateProgram(
+  input: unknown,
+  options?: ValidateOptions
+): ValidationResult;
+export function validateProgram(
+  input: unknown,
+  options?: ValidateOptions
+): ValidationResult | ConstantValidationResult {
+  const normalized = normalizeOptions(options);
+  if (!normalized.ok) {
+    return { ok: false, kind: 'invalid_options', issue: normalized.issue };
+  }
+
+  if (typeof input !== 'object' || input === null) {
+    return structuralIssue('input_not_object', '输入必须是指令数组或包含 instructions 数组的对象');
+  }
+
+  const rawInstructions = Array.isArray(input)
+    ? input
+    : (input as Record<string, unknown>).instructions;
+  if (!Array.isArray(rawInstructions)) {
+    return structuralIssue(
+      'instructions_not_array',
+      '输入必须是指令数组，或包含数组字段 instructions 的对象'
+    );
+  }
+  if (
+    rawInstructions.length < MIN_PROGRAM_LENGTH ||
+    rawInstructions.length > MAX_PROGRAM_LENGTH
+  ) {
+    return structuralIssue(
+      'instruction_count_out_of_range',
+      `指令数量必须在 ${MIN_PROGRAM_LENGTH} 到 ${MAX_PROGRAM_LENGTH} 条之间`,
+      {
+        min: MIN_PROGRAM_LENGTH,
+        max: MAX_PROGRAM_LENGTH,
+        actual: rawInstructions.length,
+      }
+    );
+  }
+
+  const decoded = decodeProgram(rawInstructions);
+
+  if (normalized.constantAware) {
+    const analysis = analyzeProgram(decoded, constantSemantics);
+    return {
+      ok: analysis.valid,
+      kind: 'program',
+      mode: 'constant_aware',
+      instructionCount: decoded.length,
+      analysis,
+    };
+  }
+
+  const analysis = analyzeProgram(decoded, typeSemantics);
+  return {
+    ok: analysis.valid,
+    kind: 'program',
+    instructionCount: decoded.length,
+    analysis,
+  };
+}
+
+export function validateJsonText(
+  text: string,
+  options: { constantAware: true }
+): ConstantValidationResult;
+export function validateJsonText(
+  text: string,
+  options?: ValidateOptions
+): ValidationResult;
+export function validateJsonText(
+  text: string,
+  options?: ValidateOptions
+): ValidationResult | ConstantValidationResult {
+  const normalized = normalizeOptions(options);
+  if (!normalized.ok) {
+    return { ok: false, kind: 'invalid_options', issue: normalized.issue };
+  }
+
   try {
     const parsed: unknown = JSON.parse(text);
-    return validateProgram(parsed);
+    return normalized.constantAware
+      ? validateProgram(parsed, { constantAware: true })
+      : validateProgram(parsed);
   } catch (error) {
     return {
       ok: false,

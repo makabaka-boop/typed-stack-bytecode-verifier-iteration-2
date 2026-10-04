@@ -1,16 +1,38 @@
 #!/usr/bin/env node
 import { promises as fs } from 'node:fs';
-import type { ValidationResult } from './validator';
+import type { ConstantValidationResult, ValidationResult } from './validator';
 import { validateJsonText } from './validator';
 
-async function readInput(): Promise<string> {
-  const args = process.argv.slice(2);
+const USAGE =
+  '用法：vmcheck [--constant-aware] [program.json]；不传文件参数时从标准输入读取';
 
-  if (args.length > 1) {
-    throw new UsageError('用法：vmcheck [program.json]；不传文件参数时从标准输入读取');
+interface CliOptions {
+  constantAware: boolean;
+  filePath?: string;
+}
+
+function parseArgs(args: string[]): CliOptions {
+  let constantAware = false;
+  let filePath: string | undefined;
+
+  for (const arg of args) {
+    if (arg === '--constant-aware') {
+      constantAware = true;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      throw new UsageError(`未知参数 ${arg}\n${USAGE}`);
+    }
+    if (filePath !== undefined) {
+      throw new UsageError(USAGE);
+    }
+    filePath = arg;
   }
 
-  const [filePath] = args;
+  return { constantAware, filePath };
+}
+
+async function readInput(filePath: string | undefined): Promise<string> {
   if (filePath !== undefined) {
     return fs.readFile(filePath, 'utf8');
   }
@@ -29,17 +51,23 @@ function readStdin(): Promise<string> {
 
 class UsageError extends Error {}
 
-function printResult(result: ValidationResult): void {
+function printResult(result: ValidationResult | ConstantValidationResult): void {
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 async function main(): Promise<number> {
   try {
-    const input = await readInput();
-    const result = validateJsonText(input);
+    const options = parseArgs(process.argv.slice(2));
+    const input = await readInput(options.filePath);
+    const result = options.constantAware
+      ? validateJsonText(input, { constantAware: true })
+      : validateJsonText(input);
     printResult(result);
     if (result.kind === 'program') {
       return result.ok ? 0 : 1;
+    }
+    if (result.kind === 'invalid_options') {
+      return 2;
     }
     return 1;
   } catch (error) {

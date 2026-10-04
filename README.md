@@ -2,6 +2,8 @@
 
 这是一个 TypeScript/Node.js 命令行校验器，用于在执行设备控制脚本前做静态控制流检查。它会从 PC 0 的空栈出发，沿所有可达控制流边传播**完整的栈类型序列**，而不是只传播栈深度。
 
+可选的常量感知模式（`--constant-aware`）在类型之外进一步跟踪**可证明的常量值**，把可证明不会走到的分支裁掉，从而区分真正可能出错的分支与永远到不了的坏指令。该模式默认关闭；不开启时输出与历史版本逐字段一致。
+
 ## 输入格式
 
 输入可以是 `{ "instructions": [...] }` 包装对象，也可以直接是顶层指令数组；指令数量为 1～500。包装对象格式：
@@ -45,8 +47,31 @@
 - 每个可达 PC 只能有一个入栈类型序列；不同入边产生不同序列时报 `stack_merge_conflict`。
 - 可达的下溢、类型错误、越界跳转、栈溢出、非法 HALT 栈和末尾跌出都会使程序无效。
 - 不可达指令只列入 `deadPcs`，即使格式错误也不会触发校验错误。
-- 分析只跟踪类型，不跟踪具体布尔值，因此 `JUMP_IF_FALSE` 的两个分支都会按可达处理。
+- 默认模式只跟踪类型，不跟踪具体布尔值，因此 `JUMP_IF_FALSE` 的两个分支都会按可达处理。
 - 固定栈状态的循环是允许的；不断改变栈类型序列的循环会在回边合流时被拒绝。
+
+## 常量感知模式
+
+通过 `--constant-aware` 标志（或库选项 `{ constantAware: true }`）启用。启用后：
+
+- 栈槽除类型外还记录可证明的常量：`pcSignatures`、见证路径和 `entryStack` 中的每个槽是
+  `{ "type": "bool", "value": true }` 这样的对象；`value` 为 `null` 表示该槽的值不可证明（未知）。
+- `JUMP_IF_FALSE` 弹出可证明的常量时，不会走的一侧不再探索；条件未知时保守地探索两边。
+- 同一 PC 的同型不同值入边会合流：常量一致的槽保留常量，其余槽变宽为未知；合流变宽后从该 PC
+  重新传播，首次到达时裁掉的后继不会沿用。
+- 类型冲突、栈深、HALT 和循环规则与默认模式相同；只有被证明确实不可达的指令才列入 `deadPcs`，
+  因此 `deadPcs` 可能比默认模式更大，`reachablePcs`、`maxStackDepth` 和错误报告始终描述同一套控制流。
+- 报告顶层带有 `"mode": "constant_aware"` 标记；默认模式的报告没有该字段，且逐字段不变。
+
+```bash
+node dist/cli.js --constant-aware examples/constant-dead.json
+```
+
+`examples/constant-dead.json` 中 PC 4 的坏指令位于可证明为真的分支之后：默认模式会报告
+`malformed_instruction`（退出码 1），常量感知模式证明它不可达，只列入 `deadPcs`（退出码 0）。
+
+模式选项本身非法（非布尔值的 `constantAware`、未知选项键、非对象选项）时整次拒绝，
+返回 `{ "ok": false, "kind": "invalid_options", ... }`，不返回任何部分分析结果。
 
 ## 本地运行
 
@@ -54,6 +79,8 @@
 npm install
 npm run build
 node dist/cli.js examples/valid.json
+# 常量感知模式
+node dist/cli.js --constant-aware examples/constant-dead.json
 # 或从 stdin 读取
 node dist/cli.js < examples/valid.json
 ```
@@ -119,4 +146,8 @@ Vitest 覆盖：
 - 栈深 32 的边界和第 33 项溢出；
 - 越界跳转、末尾跌出、下溢、类型错误和 HALT 栈约束；
 - 对 8 个直线指令生成全部 1～4 长度小程序（共 4680 个），与独立参考抽象状态枚举器逐项对拍；
-- CLI 文件输入、stdin 输入和退出码。
+- 常量感知模式：常量分支裁剪、回边合流变未知后的重新传播、不可达坏指令、
+  原有类型冲突/栈深/HALT/循环规则、默认模式逐字段兼容、非法模式选项整次拒绝；
+- 常量感知分析与独立具体执行器对拍：1500 个随机小程序加一组确定性变宽程序，
+  核对具体轨迹必可达、证明常量与具体值一致、具体错误必被报告及跨模式不变量；
+- CLI 文件输入、stdin 输入、`--constant-aware` 标志和退出码。
